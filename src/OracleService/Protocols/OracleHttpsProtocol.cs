@@ -1,3 +1,13 @@
+// Copyright (C) 2015-2021 The Neo Project.
+//
+// The Neo.Plugins.OracleService is free software distributed under the MIT software license,
+// see the accompanying file LICENSE in the main directory of the
+// project or http://www.opensource.org/licenses/mit-license.php
+// for more details.
+//
+// Redistribution and use in source and binary forms with or without
+// modifications are permitted.
+
 using Neo.Network.P2P.Payloads;
 using System;
 using System.Linq;
@@ -12,7 +22,7 @@ namespace Neo.Plugins
 {
     class OracleHttpsProtocol : IOracleProtocol
     {
-        private readonly HttpClient client = new HttpClient();
+        private readonly HttpClient client = new(new HttpClientHandler { MaxAutomaticRedirections = 5 });
 
         public OracleHttpsProtocol()
         {
@@ -40,7 +50,7 @@ namespace Neo.Plugins
 
             if (!Settings.Default.AllowPrivateHost)
             {
-                IPHostEntry entry = await Dns.GetHostEntryAsync(uri.Host);
+                IPHostEntry entry = await Dns.GetHostEntryAsync(uri.Host, cancellation);
                 if (entry.IsInternal())
                     return (OracleResponseCode.Forbidden, null);
             }
@@ -62,6 +72,14 @@ namespace Neo.Plugins
                 return (OracleResponseCode.Error, null);
             if (!Settings.Default.AllowedContentTypes.Contains(message.Content.Headers.ContentType.MediaType))
                 return (OracleResponseCode.ContentTypeNotSupported, null);
+
+            if (!Settings.Default.AllowPrivateHost && message.RequestMessage.RequestUri != uri)
+            {
+                IPHostEntry entry = await Dns.GetHostEntryAsync(message.RequestMessage.RequestUri.Host, cancellation);
+                if (entry.IsInternal())
+                    return (OracleResponseCode.Forbidden, null);
+            }
+
             return (OracleResponseCode.Success, await message.Content.ReadAsStringAsync(cancellation));
         }
     }
