@@ -22,14 +22,15 @@ namespace Neo.Consensus
         /// </summary>
         private static readonly byte[] ConsensusStateKey = { 0xf4 };
 
-        public Block Block;
+        public Block[] Block = new Block[2];
         public byte ViewNumber;
         public ECPoint[] Validators;
         public int MyIndex;
-        public UInt256[] TransactionHashes;
-        public Dictionary<UInt256, Transaction> Transactions;
-        public ExtensiblePayload[] PreparationPayloads;
-        public ExtensiblePayload[] CommitPayloads;
+        public UInt256[][] TransactionHashes = new UInt256[2][];
+        public Dictionary<UInt256, Transaction>[] Transactions = new Dictionary<UInt256, Transaction>[2];
+        public ExtensiblePayload[][] PreparationPayloads = new ExtensiblePayload[2][];
+        public ExtensiblePayload[][] PreCommitPayloads = new ExtensiblePayload[2][];
+        public ExtensiblePayload[][] CommitPayloads = new ExtensiblePayload[2][];
         public ExtensiblePayload[] ChangeViewPayloads;
         public ExtensiblePayload[] LastChangeViewPayloads;
         // LastSeenMessage array stores the height of the last seen message, for each validator.
@@ -39,7 +40,7 @@ namespace Neo.Consensus
         /// <summary>
         /// Store all verified unsorted transactions' senders' fee currently in the consensus context.
         /// </summary>
-        public TransactionVerificationContext VerificationContext = new();
+        public TransactionVerificationContext[] VerificationContext = new TransactionVerificationContext[2];
 
         public SnapshotCache Snapshot { get; private set; }
         private KeyPair keyPair;
@@ -52,17 +53,26 @@ namespace Neo.Consensus
 
         public int F => (Validators.Length - 1) / 3;
         public int M => Validators.Length - F;
-        public bool IsPrimary => MyIndex == Block.PrimaryIndex;
-        public bool IsBackup => MyIndex >= 0 && MyIndex != Block.PrimaryIndex;
+
+        public bool IsPriorityPrimary => MyIndex == GetPriorityPrimaryIndex(ViewNumber);
+        public bool IsFallbackPrimary => MyIndex == GetFallbackPrimaryIndex(ViewNumber);
+
+        public bool IsAPrimary => IsPriorityPrimary || IsFallbackPrimary;
+
+        //Modify to be 1 or 4/3
+        public float PrimaryTimerPriorityMultiplier => 1;
+        public float PrimaryTimerFallBackMultiplier => 4 / 3;
+        public float PrimaryTimerMultiplier => IsPriorityPrimary ? PrimaryTimerPriorityMultiplier : PrimaryTimerFallBackMultiplier;
+        public bool IsBackup => MyIndex >= 0 && !IsPriorityPrimary && IsFallbackPrimary;
         public bool WatchOnly => MyIndex < 0;
-        public Header PrevHeader => NativeContract.Ledger.GetHeader(Snapshot, Block.PrevHash);
+        public Header PrevHeader => NativeContract.Ledger.GetHeader(Snapshot, Block[0].PrevHash);
         public int CountCommitted => CommitPayloads.Count(p => p != null);
         public int CountFailed
         {
             get
             {
                 if (LastSeenMessage == null) return 0;
-                return Validators.Count(p => !LastSeenMessage.TryGetValue(p, out var value) || value < (Block.Index - 1));
+                return Validators.Count(p => !LastSeenMessage.TryGetValue(p, out var value) || value < (Block[0].Index - 1));
             }
         }
         public bool ValidatorsChanged
@@ -78,10 +88,10 @@ namespace Neo.Consensus
         }
 
         #region Consensus States
-        public bool RequestSentOrReceived => PreparationPayloads[Block.PrimaryIndex] != null;
-        public bool ResponseSent => !WatchOnly && PreparationPayloads[MyIndex] != null;
-        public bool CommitSent => !WatchOnly && CommitPayloads[MyIndex] != null;
-        public bool BlockSent => Block.Transactions != null;
+        public bool RequestSentOrReceived => (PreparationPayloads[0][GetPriorityPrimaryIndex(ViewNumber)] != null || PreparationPayloads[1][GetFallbackPrimaryIndex(ViewNumber)] != null);
+        public bool ResponseSent => !WatchOnly && (PreparationPayloads[0][MyIndex] != null || PreparationPayloads[1][MyIndex] != null);
+        public bool CommitSent => !WatchOnly && (CommitPayloads[0][MyIndex] != null || CommitPayloads[1][MyIndex] != null);
+        public bool BlockSent => (Block[0].Transactions != null || Block[1].Transactions != null);
         public bool ViewChanging => !WatchOnly && GetMessage<ChangeView>(ChangeViewPayloads[MyIndex])?.NewViewNumber > ViewNumber;
         public bool NotAcceptingPayloadsDueToViewChanging => ViewChanging && !MoreThanFNodesCommittedOrLost;
         // A possible attack can happen if the last node to commit is malicious and either sends change view after his
@@ -102,20 +112,20 @@ namespace Neo.Consensus
             this.store = neoSystem.LoadStore(settings.RecoveryLogs);
         }
 
-        public Block CreateBlock()
+        public Block CreateBlock(uint pID)
         {
-            EnsureHeader();
+            EnsureHeader(pID);
             Contract contract = Contract.CreateMultiSigContract(M, Validators);
-            ContractParametersContext sc = new ContractParametersContext(neoSystem.StoreView, Block.Header, dbftSettings.Network);
+            ContractParametersContext sc = new ContractParametersContext(neoSystem.StoreView, Block[pID].Header, dbftSettings.Network);
             for (int i = 0, j = 0; i < Validators.Length && j < M; i++)
             {
-                if (GetMessage(CommitPayloads[i])?.ViewNumber != ViewNumber) continue;
-                sc.AddSignature(contract, Validators[i], GetMessage<Commit>(CommitPayloads[i]).Signature);
+                if (GetMessage(CommitPayloads[pID][i])?.ViewNumber != ViewNumber) continue;
+                sc.AddSignature(contract, Validators[i], GetMessage<Commit>(CommitPayloads[pID][i]).Signature);
                 j++;
             }
-            Block.Header.Witness = sc.GetWitnesses()[0];
-            Block.Transactions = TransactionHashes.Select(p => Transactions[p]).ToArray();
-            return Block;
+            Block[pID].Header.Witness = sc.GetWitnesses()[0];
+            Block[pID].Transactions = TransactionHashes[pID].Select(p => Transactions[pID][p]).ToArray();
+            return Block[pID];
         }
 
         public ExtensiblePayload CreatePayload(ConsensusMessage message, byte[] invocationScript = null)
@@ -142,11 +152,11 @@ namespace Neo.Consensus
             Snapshot?.Dispose();
         }
 
-        public Block EnsureHeader()
+        public Block EnsureHeader(uint pID)
         {
-            if (TransactionHashes == null) return null;
-            Block.Header.MerkleRoot ??= MerkleTree.ComputeRoot(TransactionHashes);
-            return Block;
+            if (TransactionHashes[pID] == null) return null;
+            Block[pID].Header.MerkleRoot ??= MerkleTree.ComputeRoot(TransactionHashes[pID]);
+            return Block[pID];
         }
 
         public bool Load()
@@ -175,18 +185,21 @@ namespace Neo.Consensus
                 Snapshot?.Dispose();
                 Snapshot = neoSystem.GetSnapshot();
                 uint height = NativeContract.Ledger.CurrentIndex(Snapshot);
-                Block = new Block
+                for (uint i = 0; i <= 1; i++)
                 {
-                    Header = new Header
+                    Block[i] = new Block
                     {
-                        PrevHash = NativeContract.Ledger.CurrentHash(Snapshot),
-                        Index = height + 1,
-                        NextConsensus = Contract.GetBFTAddress(
-                            NeoToken.ShouldRefreshCommittee(height + 1, neoSystem.Settings.CommitteeMembersCount) ?
-                            NativeContract.NEO.ComputeNextBlockValidators(Snapshot, neoSystem.Settings) :
-                            NativeContract.NEO.GetNextBlockValidators(Snapshot, neoSystem.Settings.ValidatorsCount))
-                    }
-                };
+                        Header = new Header
+                        {
+                            PrevHash = NativeContract.Ledger.CurrentHash(Snapshot),
+                            Index = height + 1,
+                            NextConsensus = Contract.GetBFTAddress(
+                                NeoToken.ShouldRefreshCommittee(height + 1, neoSystem.Settings.CommitteeMembersCount) ?
+                                NativeContract.NEO.ComputeNextBlockValidators(Snapshot, neoSystem.Settings) :
+                                NativeContract.NEO.GetNextBlockValidators(Snapshot, neoSystem.Settings.ValidatorsCount))
+                        }
+                    };
+                }
                 var pv = Validators;
                 Validators = NativeContract.NEO.GetNextBlockValidators(Snapshot, neoSystem.Settings.ValidatorsCount);
                 if (_witnessSize == 0 || (pv != null && pv.Length != Validators.Length))
@@ -206,9 +219,10 @@ namespace Neo.Consensus
                     }
                 }
                 MyIndex = -1;
+                for (uint i = 0; i <= 1; i++)
+                    CommitPayloads[i] = new ExtensiblePayload[Validators.Length];
                 ChangeViewPayloads = new ExtensiblePayload[Validators.Length];
                 LastChangeViewPayloads = new ExtensiblePayload[Validators.Length];
-                CommitPayloads = new ExtensiblePayload[Validators.Length];
                 if (ValidatorsChanged || LastSeenMessage is null)
                 {
                     var previous_last_seen_message = LastSeenMessage;
@@ -240,15 +254,33 @@ namespace Neo.Consensus
                     else
                         LastChangeViewPayloads[i] = null;
             }
+
             ViewNumber = viewNumber;
-            Block.Header.PrimaryIndex = GetPrimaryIndex(viewNumber);
-            Block.Header.MerkleRoot = null;
-            Block.Header.Timestamp = 0;
-            Block.Header.Nonce = 0;
-            Block.Transactions = null;
-            TransactionHashes = null;
-            PreparationPayloads = new ExtensiblePayload[Validators.Length];
-            if (MyIndex >= 0) LastSeenMessage[Validators[MyIndex]] = Block.Index;
+            for (uint pID = 0; pID <= 1; pID++)
+            {
+                Block[pID].Header.PrimaryIndex = GetPriorityPrimaryIndex(viewNumber);
+                Block[pID].Header.MerkleRoot = null;
+                Block[pID].Header.Timestamp = 0;
+                Block[pID].Header.Nonce = 0;
+                Block[pID].Transactions = null;
+                TransactionHashes[pID] = null;
+                PreparationPayloads[pID] = new ExtensiblePayload[Validators.Length];
+                if (MyIndex >= 0) LastSeenMessage[Validators[MyIndex]] = Block[pID].Index;
+            }
+
+            //=========================================
+            // Disable Fallback if viewnumber > 1
+            if (viewNumber > 0)
+            {
+                Block[1] = null;
+                TransactionHashes[1] = null;
+                Transactions[1] = null;
+                VerificationContext[1] = null;
+                PreparationPayloads[1] = null;
+                PreCommitPayloads[1] = null;
+                CommitPayloads[1] = null;
+            }
+            //=========================================
         }
 
         public void Save()
@@ -259,47 +291,64 @@ namespace Neo.Consensus
         public void Deserialize(BinaryReader reader)
         {
             Reset(0);
-            if (reader.ReadUInt32() != Block.Version) throw new FormatException();
-            if (reader.ReadUInt32() != Block.Index) throw new InvalidOperationException();
-            Block.Header.Timestamp = reader.ReadUInt64();
-            Block.Header.Nonce = reader.ReadUInt64();
-            Block.Header.PrimaryIndex = reader.ReadByte();
-            Block.Header.NextConsensus = reader.ReadSerializable<UInt160>();
-            if (Block.NextConsensus.Equals(UInt160.Zero))
-                Block.Header.NextConsensus = null;
+            for (uint pID = 0; pID <= 1; pID++)
+            {
+                if (reader.ReadUInt32() != Block[pID].Version) throw new FormatException();
+                if (reader.ReadUInt32() != Block[pID].Index) throw new InvalidOperationException();
+                Block[pID].Header.Timestamp = reader.ReadUInt64();
+                Block[pID].Header.Nonce = reader.ReadUInt64();
+                Block[pID].Header.PrimaryIndex = reader.ReadByte();
+                Block[pID].Header.NextConsensus = reader.ReadSerializable<UInt160>();
+                if (Block[pID].NextConsensus.Equals(UInt160.Zero))
+                    Block[pID].Header.NextConsensus = null;
+
+                TransactionHashes[pID] = reader.ReadSerializableArray<UInt256>(ushort.MaxValue);
+                Transaction[] transactions = reader.ReadSerializableArray<Transaction>(ushort.MaxValue);
+                PreparationPayloads[pID] = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
+                PreCommitPayloads[pID] = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
+                CommitPayloads[pID] = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
+
+                if (TransactionHashes[pID].Length == 0 && !RequestSentOrReceived)
+                    TransactionHashes[pID] = null;
+                Transactions[pID] = transactions.Length == 0 && !RequestSentOrReceived ? null : transactions.ToDictionary(p => p.Hash);
+                VerificationContext[pID] = new TransactionVerificationContext();
+                if (Transactions[pID] != null)
+                {
+                    foreach (Transaction tx in Transactions[pID].Values)
+                        VerificationContext[pID].AddTransaction(tx);
+                }
+            }
+
             ViewNumber = reader.ReadByte();
-            TransactionHashes = reader.ReadSerializableArray<UInt256>(ushort.MaxValue);
-            Transaction[] transactions = reader.ReadSerializableArray<Transaction>(ushort.MaxValue);
-            PreparationPayloads = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
-            CommitPayloads = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
             ChangeViewPayloads = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
             LastChangeViewPayloads = reader.ReadNullableArray<ExtensiblePayload>(neoSystem.Settings.ValidatorsCount);
-            if (TransactionHashes.Length == 0 && !RequestSentOrReceived)
-                TransactionHashes = null;
-            Transactions = transactions.Length == 0 && !RequestSentOrReceived ? null : transactions.ToDictionary(p => p.Hash);
-            VerificationContext = new TransactionVerificationContext();
-            if (Transactions != null)
-            {
-                foreach (Transaction tx in Transactions.Values)
-                    VerificationContext.AddTransaction(tx);
-            }
+
         }
 
         public void Serialize(BinaryWriter writer)
         {
-            writer.Write(Block.Version);
-            writer.Write(Block.Index);
-            writer.Write(Block.Timestamp);
-            writer.Write(Block.Nonce);
-            writer.Write(Block.PrimaryIndex);
-            writer.Write(Block.NextConsensus ?? UInt160.Zero);
+            for (uint i = 0; i <= 1; i++)
+            {
+                writer.Write(Block[i].Version);
+                writer.Write(Block[i].Index);
+                writer.Write(Block[i].Timestamp);
+                writer.Write(Block[i].Nonce);
+                writer.Write(Block[i].PrimaryIndex);
+                writer.Write(Block[i].NextConsensus ?? UInt160.Zero);
+                writer.Write(TransactionHashes[i] ?? Array.Empty<UInt256>());
+                writer.Write(Transactions[i]?.Values.ToArray() ?? Array.Empty<Transaction>());
+                writer.WriteNullableArray(PreparationPayloads[i]);
+                writer.WriteNullableArray(PreCommitPayloads[i]);
+                writer.WriteNullableArray(CommitPayloads[i]);
+            }
             writer.Write(ViewNumber);
-            writer.Write(TransactionHashes ?? Array.Empty<UInt256>());
-            writer.Write(Transactions?.Values.ToArray() ?? Array.Empty<Transaction>());
-            writer.WriteNullableArray(PreparationPayloads);
-            writer.WriteNullableArray(CommitPayloads);
             writer.WriteNullableArray(ChangeViewPayloads);
             writer.WriteNullableArray(LastChangeViewPayloads);
+        }
+
+        private static void Log(string message, LogLevel level = LogLevel.Info)
+        {
+            Utility.Log(nameof(ConsensusService), level, message);
         }
     }
 }

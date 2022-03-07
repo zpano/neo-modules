@@ -69,19 +69,21 @@ namespace Neo.Consensus
         {
             context.Reset(viewNumber);
             if (viewNumber > 0)
-                Log($"View changed: view={viewNumber} primary={context.Validators[context.GetPrimaryIndex((byte)(viewNumber - 1u))]}", LogLevel.Warning);
-            Log($"Initialize: height={context.Block.Index} view={viewNumber} index={context.MyIndex} role={(context.IsPrimary ? "Primary" : context.WatchOnly ? "WatchOnly" : "Backup")}");
+                Log($"View changed: view={viewNumber} primary={context.Validators[context.GetPriorityPrimaryIndex((byte)(viewNumber - 1u))]}", LogLevel.Warning);
+            uint blockCurrentIndex = context.Block[0].Index;
+            Log($"Initialize: height={blockCurrentIndex} view={viewNumber} index={context.MyIndex} role={(context.IsPriorityPrimary ? "PrimaryP1" : context.IsFallbackPrimary ? "PrimaryP2" : context.WatchOnly ? "WatchOnly" : "Backup")}");
             if (context.WatchOnly) return;
-            if (context.IsPrimary)
+            if (context.IsAPrimary)
             {
                 if (isRecovering)
                 {
-                    ChangeTimer(TimeSpan.FromMilliseconds(neoSystem.Settings.MillisecondsPerBlock << (viewNumber + 1)));
+                    ChangeTimer(TimeSpan.FromMilliseconds(context.PrimaryTimerMultiplier * (neoSystem.Settings.MillisecondsPerBlock << (viewNumber + 1))));
                 }
                 else
                 {
-                    TimeSpan span = neoSystem.Settings.TimePerBlock;
-                    if (block_received_index + 1 == context.Block.Index)
+                    // If both Primaries already expired move to Zero or take the difference
+                    TimeSpan span = TimeSpan.FromMilliseconds(context.PrimaryTimerMultiplier * neoSystem.Settings.MillisecondsPerBlock);
+                    if (block_received_index + 1 == blockCurrentIndex)
                     {
                         var diff = TimeProvider.Current.UtcNow - block_received_time;
                         if (diff >= span)
@@ -133,16 +135,18 @@ namespace Neo.Consensus
             started = true;
             if (!dbftSettings.IgnoreRecoveryLogs && context.Load())
             {
-                if (context.Transactions != null)
+                // For Now, only checking Transactions for Priority 
+                // Fallback works only for viewnumber 0 and this will not really make a difference
+                if (context.Transactions[0] != null)
                 {
                     blockchain.Ask<Blockchain.FillCompleted>(new Blockchain.FillMemoryPool
                     {
-                        Transactions = context.Transactions.Values
+                        Transactions = context.Transactions[0].Values
                     }).Wait();
                 }
                 if (context.CommitSent)
                 {
-                    CheckPreparations();
+                    CheckPreparations(0);
                     return;
                 }
             }
@@ -154,13 +158,14 @@ namespace Neo.Consensus
 
         private void OnTimer(Timer timer)
         {
+            uint pID = Convert.ToUInt32(!context.IsPriorityPrimary);
             if (context.WatchOnly || context.BlockSent) return;
-            if (timer.Height != context.Block.Index || timer.ViewNumber != context.ViewNumber) return;
-            if (context.IsPrimary && !context.RequestSentOrReceived)
+            if (timer.Height != context.Block[pID].Index || timer.ViewNumber != context.ViewNumber) return;
+            if (context.IsAPrimary && !context.RequestSentOrReceived)
             {
-                SendPrepareRequest();
+                SendPrepareRequest(pID);
             }
-            else if ((context.IsPrimary && context.RequestSentOrReceived) || context.IsBackup)
+            else if ((context.IsAPrimary && context.RequestSentOrReceived) || context.IsBackup)
             {
                 if (context.CommitSent)
                 {
@@ -173,7 +178,7 @@ namespace Neo.Consensus
                 {
                     var reason = ChangeViewReason.Timeout;
 
-                    if (context.Block != null && context.TransactionHashes?.Length > context.Transactions?.Count)
+                    if (context.Block[pID] != null && context.TransactionHashes[pID]?.Length > context.Transactions[pID]?.Count)
                     {
                         reason = ChangeViewReason.TxNotFound;
                     }
@@ -183,25 +188,28 @@ namespace Neo.Consensus
             }
         }
 
-        private void SendPrepareRequest()
+        private void SendPrepareRequest(uint pID)
         {
-            Log($"Sending {nameof(PrepareRequest)}: height={context.Block.Index} view={context.ViewNumber}");
-            localNode.Tell(new LocalNode.SendDirectly { Inventory = context.MakePrepareRequest() });
+            Log($"Sending {nameof(PrepareRequest)}: height={context.Block[pID].Index} view={context.ViewNumber} Id={pID}");
+            localNode.Tell(new LocalNode.SendDirectly { Inventory = context.MakePrepareRequest(pID) });
 
             if (context.Validators.Length == 1)
-                CheckPreparations();
+                CheckPreparations(pID);
 
-            if (context.TransactionHashes.Length > 0)
+            Log($"SendPrepareRequest I", LogLevel.Debug);
+
+            if (context.TransactionHashes[pID].Length > 0)
             {
-                foreach (InvPayload payload in InvPayload.CreateGroup(InventoryType.TX, context.TransactionHashes))
+                foreach (InvPayload payload in InvPayload.CreateGroup(InventoryType.TX, context.TransactionHashes[pID]))
                     localNode.Tell(Message.Create(MessageCommand.Inv, payload));
             }
-            ChangeTimer(TimeSpan.FromMilliseconds((neoSystem.Settings.MillisecondsPerBlock << (context.ViewNumber + 1)) - (context.ViewNumber == 0 ? neoSystem.Settings.MillisecondsPerBlock : 0)));
+            Log($"SendPrepareRequest II", LogLevel.Debug);
+            ChangeTimer(TimeSpan.FromMilliseconds(context.PrimaryTimerMultiplier * ((neoSystem.Settings.MillisecondsPerBlock << (context.ViewNumber + 1)) - (context.ViewNumber == 0 ? neoSystem.Settings.MillisecondsPerBlock : 0))));
         }
 
         private void RequestRecovery()
         {
-            Log($"Sending {nameof(RecoveryRequest)}: height={context.Block.Index} view={context.ViewNumber} nc={context.CountCommitted} nf={context.CountFailed}");
+            Log($"Sending {nameof(RecoveryRequest)}: height={context.Block[0].Index} view={context.ViewNumber} nc={context.CountCommitted} nf={context.CountFailed}");
             localNode.Tell(new LocalNode.SendDirectly { Inventory = context.MakeRecoveryRequest() });
         }
 
@@ -220,7 +228,7 @@ namespace Neo.Consensus
             }
             else
             {
-                Log($"Sending {nameof(ChangeView)}: height={context.Block.Index} view={context.ViewNumber} nv={expectedView} nc={context.CountCommitted} nf={context.CountFailed} reason={reason}");
+                Log($"Sending {nameof(ChangeView)}: height={context.Block[0].Index} view={context.ViewNumber} nv={expectedView} nc={context.CountCommitted} nf={context.CountFailed} reason={reason}");
                 localNode.Tell(new LocalNode.SendDirectly { Inventory = context.MakeChangeView(reason) });
                 CheckExpectedView(expectedView);
             }
@@ -238,26 +246,33 @@ namespace Neo.Consensus
         {
             if (!context.IsBackup || context.NotAcceptingPayloadsDueToViewChanging || !context.RequestSentOrReceived || context.ResponseSent || context.BlockSent)
                 return;
-            if (context.Transactions.ContainsKey(transaction.Hash)) return;
-            if (!context.TransactionHashes.Contains(transaction.Hash)) return;
+            if (context.Transactions[0].ContainsKey(transaction.Hash) || context.Transactions[1].ContainsKey(transaction.Hash)) return;
+            if (!context.TransactionHashes[0].Contains(transaction.Hash) && !context.TransactionHashes[1].Contains(transaction.Hash)) return;
             AddTransaction(transaction, true);
         }
 
         private bool AddTransaction(Transaction tx, bool verify)
         {
-            if (verify)
-            {
-                VerifyResult result = tx.Verify(neoSystem.Settings, context.Snapshot, context.VerificationContext);
-                if (result != VerifyResult.Succeed)
+            bool returnValue = false;
+            for (uint i = 0; i <= 1; i++)
+                if (context.TransactionHashes[i].Contains(tx.Hash))
                 {
-                    Log($"Rejected tx: {tx.Hash}, {result}{Environment.NewLine}{tx.ToArray().ToHexString()}", LogLevel.Warning);
-                    RequestChangeView(result == VerifyResult.PolicyFail ? ChangeViewReason.TxRejectedByPolicy : ChangeViewReason.TxInvalid);
-                    return false;
+                    if (verify)
+                    {
+                        VerifyResult result = tx.Verify(neoSystem.Settings, context.Snapshot, context.VerificationContext[i]);
+                        if (result != VerifyResult.Succeed)
+                        {
+                            Log($"Rejected tx: {tx.Hash}, {result}{Environment.NewLine}{tx.ToArray().ToHexString()}", LogLevel.Warning);
+                            RequestChangeView(result == VerifyResult.PolicyFail ? ChangeViewReason.TxRejectedByPolicy : ChangeViewReason.TxInvalid);
+                            return false;
+                        }
+                    }
+
+                    context.Transactions[i][tx.Hash] = tx;
+                    context.VerificationContext[i].AddTransaction(tx);
+                    returnValue = returnValue || CheckPrepareResponse(i);
                 }
-            }
-            context.Transactions[tx.Hash] = tx;
-            context.VerificationContext.AddTransaction(tx);
-            return CheckPrepareResponse();
+            return returnValue;
         }
 
         private void ChangeTimer(TimeSpan delay)
@@ -267,7 +282,7 @@ namespace Neo.Consensus
             timer_token.CancelIfNotNull();
             timer_token = Context.System.Scheduler.ScheduleTellOnceCancelable(delay, Self, new Timer
             {
-                Height = context.Block.Index,
+                Height = context.Block[0].Index,
                 ViewNumber = context.ViewNumber
             }, ActorRefs.NoSender);
         }

@@ -33,11 +33,11 @@ namespace Neo.Consensus
                 return;
             }
             if (!message.Verify(neoSystem.Settings)) return;
-            if (message.BlockIndex != context.Block.Index)
+            if (message.BlockIndex != context.Block[0].Index)
             {
-                if (context.Block.Index < message.BlockIndex)
+                if (context.Block[0].Index < message.BlockIndex)
                 {
-                    Log($"Chain is behind: expected={message.BlockIndex} current={context.Block.Index - 1}", LogLevel.Warning);
+                    Log($"Chain is behind: expected={message.BlockIndex} current={context.Block[0].Index - 1}", LogLevel.Warning);
                 }
                 return;
             }
@@ -55,6 +55,9 @@ namespace Neo.Consensus
                 case ChangeView view:
                     OnChangeViewReceived(payload, view);
                     break;
+                case PreCommit precommit:
+                    OnPreCommitReceived(payload, precommit);
+                    break;
                 case Commit commit:
                     OnCommitReceived(payload, commit);
                     break;
@@ -70,10 +73,13 @@ namespace Neo.Consensus
         private void OnPrepareRequestReceived(ExtensiblePayload payload, PrepareRequest message)
         {
             if (context.RequestSentOrReceived || context.NotAcceptingPayloadsDueToViewChanging) return;
-            if (message.ValidatorIndex != context.Block.PrimaryIndex || message.ViewNumber != context.ViewNumber) return;
-            if (message.Version != context.Block.Version || message.PrevHash != context.Block.PrevHash) return;
+            uint pOrF = Convert.ToUInt32(message.ValidatorIndex == context.GetPriorityPrimaryIndex(context.ViewNumber));
+            // Add verification for Fallback
+            if (message.ValidatorIndex != context.Block[pOrF].PrimaryIndex || message.ViewNumber != context.ViewNumber) return;
+            if (message.Version != context.Block[pOrF].Version || message.PrevHash != context.Block[pOrF].PrevHash) return;
             if (message.TransactionHashes.Length > neoSystem.Settings.MaxTransactionsPerBlock) return;
-            Log($"{nameof(OnPrepareRequestReceived)}: height={message.BlockIndex} view={message.ViewNumber} index={message.ValidatorIndex} tx={message.TransactionHashes.Length}");
+
+            Log($"{nameof(OnPrepareRequestReceived)}: height={message.BlockIndex} view={message.ViewNumber} index={message.ValidatorIndex} tx={message.TransactionHashes.Length} priority={message.ValidatorIndex == context.GetPriorityPrimaryIndex(context.ViewNumber)} fallback={message.ValidatorIndex == context.GetFallbackPrimaryIndex(context.ViewNumber)}");
             if (message.Timestamp <= context.PrevHeader.Timestamp || message.Timestamp > TimeProvider.Current.UtcNow.AddMilliseconds(8 * neoSystem.Settings.MillisecondsPerBlock).ToTimestampMS())
             {
                 Log($"Timestamp incorrect: {message.Timestamp}", LogLevel.Warning);
@@ -90,33 +96,34 @@ namespace Neo.Consensus
             // around 2*15/M=30.0/5 ~ 40% block time (for M=5)
             ExtendTimerByFactor(2);
 
-            context.Block.Header.Timestamp = message.Timestamp;
-            context.Block.Header.Nonce = message.Nonce;
-            context.TransactionHashes = message.TransactionHashes;
+            context.Block[pOrF].Header.Timestamp = message.Timestamp;
+            context.Block[pOrF].Header.Nonce = message.Nonce;
+            context.TransactionHashes[pOrF] = message.TransactionHashes;
 
-            context.Transactions = new Dictionary<UInt256, Transaction>();
-            context.VerificationContext = new TransactionVerificationContext();
-            for (int i = 0; i < context.PreparationPayloads.Length; i++)
-                if (context.PreparationPayloads[i] != null)
-                    if (!context.GetMessage<PrepareResponse>(context.PreparationPayloads[i]).PreparationHash.Equals(payload.Hash))
-                        context.PreparationPayloads[i] = null;
-            context.PreparationPayloads[message.ValidatorIndex] = payload;
-            byte[] hashData = context.EnsureHeader().GetSignData(neoSystem.Settings.Network);
-            for (int i = 0; i < context.CommitPayloads.Length; i++)
-                if (context.GetMessage(context.CommitPayloads[i])?.ViewNumber == context.ViewNumber)
-                    if (!Crypto.VerifySignature(hashData, context.GetMessage<Commit>(context.CommitPayloads[i]).Signature, context.Validators[i]))
-                        context.CommitPayloads[i] = null;
+            context.Transactions[pOrF] = new Dictionary<UInt256, Transaction>();
+            context.VerificationContext[pOrF] = new TransactionVerificationContext();
+            for (int i = 0; i < context.PreparationPayloads[pOrF].Length; i++)
+                if (context.PreparationPayloads[pOrF][i] != null)
+                    if (!context.GetMessage<PrepareResponse>(context.PreparationPayloads[pOrF][i]).PreparationHash.Equals(payload.Hash))
+                        context.PreparationPayloads[pOrF][i] = null;
+            context.PreparationPayloads[pOrF][message.ValidatorIndex] = payload;
+            byte[] hashData = context.EnsureHeader(pOrF).GetSignData(neoSystem.Settings.Network);
+            for (int i = 0; i < context.CommitPayloads[pOrF].Length; i++)
+                if (context.GetMessage(context.CommitPayloads[pOrF][i])?.ViewNumber == context.ViewNumber)
+                    if (!Crypto.VerifySignature(hashData, context.GetMessage<Commit>(context.CommitPayloads[pOrF][i]).Signature, context.Validators[i]))
+                        context.CommitPayloads[pOrF][i] = null;
 
-            if (context.TransactionHashes.Length == 0)
+            if (context.TransactionHashes[pOrF].Length == 0)
             {
                 // There are no tx so we should act like if all the transactions were filled
-                CheckPrepareResponse();
+                CheckPrepareResponse(pOrF);
                 return;
             }
 
             Dictionary<UInt256, Transaction> mempoolVerified = neoSystem.MemPool.GetVerifiedTransactions().ToDictionary(p => p.Hash);
             List<Transaction> unverified = new List<Transaction>();
-            foreach (UInt256 hash in context.TransactionHashes)
+            //Cash previous asked TX Hashes
+            foreach (UInt256 hash in context.TransactionHashes[pOrF])
             {
                 if (mempoolVerified.TryGetValue(hash, out Transaction tx))
                 {
@@ -132,9 +139,9 @@ namespace Neo.Consensus
             foreach (Transaction tx in unverified)
                 if (!AddTransaction(tx, true))
                     return;
-            if (context.Transactions.Count < context.TransactionHashes.Length)
+            if (context.Transactions[pOrF].Count < context.TransactionHashes[pOrF].Length)
             {
-                UInt256[] hashes = context.TransactionHashes.Where(i => !context.Transactions.ContainsKey(i)).ToArray();
+                UInt256[] hashes = context.TransactionHashes[pOrF].Where(i => !context.Transactions[pOrF].ContainsKey(i)).ToArray();
                 taskManager.Tell(new TaskManager.RestartTasks
                 {
                     Payload = InvPayload.Create(InventoryType.TX, hashes)
@@ -145,19 +152,33 @@ namespace Neo.Consensus
         private void OnPrepareResponseReceived(ExtensiblePayload payload, PrepareResponse message)
         {
             if (message.ViewNumber != context.ViewNumber) return;
-            if (context.PreparationPayloads[message.ValidatorIndex] != null || context.NotAcceptingPayloadsDueToViewChanging) return;
-            if (context.PreparationPayloads[context.Block.PrimaryIndex] != null && !message.PreparationHash.Equals(context.PreparationPayloads[context.Block.PrimaryIndex].Hash))
+            if (context.PreparationPayloads[message.Id][message.ValidatorIndex] != null || context.NotAcceptingPayloadsDueToViewChanging) return;
+            if (context.PreparationPayloads[message.Id][context.Block[message.Id].PrimaryIndex] != null && !message.PreparationHash.Equals(context.PreparationPayloads[message.Id][context.Block[message.Id].PrimaryIndex].Hash))
                 return;
 
             // Timeout extension: prepare response has been received with success
             // around 2*15/M=30.0/5 ~ 40% block time (for M=5)
             ExtendTimerByFactor(2);
 
-            Log($"{nameof(OnPrepareResponseReceived)}: height={message.BlockIndex} view={message.ViewNumber} index={message.ValidatorIndex}");
-            context.PreparationPayloads[message.ValidatorIndex] = payload;
+            Log($"{nameof(OnPrepareResponseReceived)}: height={message.BlockIndex} view={message.ViewNumber} index={message.ValidatorIndex} Id={message.Id}");
+            context.PreparationPayloads[message.Id][message.ValidatorIndex] = payload;
             if (context.WatchOnly || context.CommitSent) return;
             if (context.RequestSentOrReceived)
-                CheckPreparations();
+                CheckPreparations(message.Id);
+        }
+
+        private void OnPreCommitReceived(ExtensiblePayload payload, PreCommit message)
+        {
+            if (message.ViewNumber != context.ViewNumber) return;
+            if (context.PreparationPayloads[message.Id][message.ValidatorIndex] != null || context.NotAcceptingPayloadsDueToViewChanging) return;
+            if (context.PreparationPayloads[message.Id][context.Block[message.Id].PrimaryIndex] != null && !message.PreparationHash.Equals(context.PreparationPayloads[message.Id][context.Block[message.Id].PrimaryIndex].Hash))
+                return;
+
+            Log($"{nameof(OnPreCommitReceived)}: height={message.BlockIndex} view={message.ViewNumber} index={message.ValidatorIndex} Id={message.Id}");
+            context.PreCommitPayloads[message.Id][message.ValidatorIndex] = payload;
+            if (context.WatchOnly || context.CommitSent) return;
+            if (context.RequestSentOrReceived)
+                CheckPreCommits(message.Id);
         }
 
         private void OnChangeViewReceived(ExtensiblePayload payload, ChangeView message)
@@ -178,11 +199,11 @@ namespace Neo.Consensus
 
         private void OnCommitReceived(ExtensiblePayload payload, Commit commit)
         {
-            ref ExtensiblePayload existingCommitPayload = ref context.CommitPayloads[commit.ValidatorIndex];
+            ref ExtensiblePayload existingCommitPayload = ref context.CommitPayloads[commit.Id][commit.ValidatorIndex];
             if (existingCommitPayload != null)
             {
                 if (existingCommitPayload.Hash != payload.Hash)
-                    Log($"Rejected {nameof(Commit)}: height={commit.BlockIndex} index={commit.ValidatorIndex} view={commit.ViewNumber} existingView={context.GetMessage(existingCommitPayload).ViewNumber}", LogLevel.Warning);
+                    Log($"Rejected {nameof(Commit)}: height={commit.BlockIndex} index={commit.ValidatorIndex} view={commit.ViewNumber} existingView={context.GetMessage(existingCommitPayload).ViewNumber} id={commit.Id}", LogLevel.Warning);
                 return;
             }
 
@@ -194,7 +215,7 @@ namespace Neo.Consensus
             {
                 Log($"{nameof(OnCommitReceived)}: height={commit.BlockIndex} view={commit.ViewNumber} index={commit.ValidatorIndex} nc={context.CountCommitted} nf={context.CountFailed}");
 
-                byte[] hashData = context.EnsureHeader()?.GetSignData(neoSystem.Settings.Network);
+                byte[] hashData = context.EnsureHeader(commit.Id)?.GetSignData(neoSystem.Settings.Network);
                 if (hashData == null)
                 {
                     existingCommitPayload = payload;
@@ -202,7 +223,7 @@ namespace Neo.Consensus
                 else if (Crypto.VerifySignature(hashData, commit.Signature, context.Validators[commit.ValidatorIndex]))
                 {
                     existingCommitPayload = payload;
-                    CheckCommits();
+                    CheckCommits(commit.Id);
                 }
                 return;
             }
@@ -241,8 +262,11 @@ namespace Neo.Consensus
                             totalPrepReq = 1;
                             if (ReverifyAndProcessPayload(prepareRequestPayload)) validPrepReq++;
                         }
-                        else if (context.IsPrimary)
-                            SendPrepareRequest();
+                        else if (context.IsPriorityPrimary || (context.IsFallbackPrimary && message.ViewNumber == 0))
+                        {
+                            uint pID = Convert.ToUInt32(!context.IsPriorityPrimary);
+                            SendPrepareRequest(pID);
+                        }
                     }
                     ExtensiblePayload[] prepareResponsePayloads = message.GetPrepareResponsePayloads(context);
                     totalPrepResponses = prepareResponsePayloads.Length;
